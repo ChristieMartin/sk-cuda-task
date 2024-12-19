@@ -1,563 +1,484 @@
-#define _USE_MATH_DEFINES
-#include <iostream>
-#include <cmath>
-#include <vector>
-#include <functional>
 #include <mpi.h>
+#include <fstream>
+#include <vector>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
-#include <cuda_runtime.h>
-
-#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true){
-   if (code != cudaSuccess){
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-
-__constant__ double d_Lx;
-__constant__ double d_Ly;
-__constant__ double d_Lz;
-__constant__ double d_at;
-__constant__ double d_hx;
-__constant__ double d_hy;
-__constant__ double d_hz;
 
 const int numThreads = 128;
 
-__host__ __device__
-double analyticalSolution(double x, double y, double z, double t, double Lx, double Ly, double Lz, double at_val) {
-    return sin(3 * M_PI * x / Lx) *
-           sin(2 * M_PI * y / Ly) *
-           sin(2 * M_PI * z / Lz) *
-           cos(at_val * t + 4 * M_PI);
+struct Buffer {
+    int xLeft;
+    int xRight;
+    int yLeft;
+    int yRight;
+    int zLeft;
+    int zRight;
+    int xLen;
+    int yLen;
+    int zLen;
+    int size;
+
+    Buffer() {}
+
+    Buffer(int xLeft, int xRight, int yLeft, int yRight, int zLeft, int zRight) : xLeft(xLeft), xRight(xRight),
+        yLeft(yLeft), yRight(yRight), zLeft(zLeft), zRight(zRight) {
+        xLen = xRight - xLeft + 1;
+        yLen = yRight - yLeft + 1;
+        zLen = zRight - zLeft + 1;
+        size = xLen * yLen * zLen;
+    }
+
+    inline bool operator<(const Buffer& other) const {
+        return other.xLeft <= xLeft && xRight <= other.xRight &&
+               other.yLeft <= yLeft && yRight <= other.yRight &&
+               other.zLeft <= zLeft && zRight <= other.zRight;
+    }
+};
+
+
+void initializeBuffers(std::vector<Buffer> &buffers, int dim, int xLeft, int xRight, int yLeft, int yRight, int zLeft, int zRight, int size) {
+    
+    if (size == 1) {
+        buffers.push_back(Buffer(xLeft, xRight, yLeft, yRight, zLeft, zRight));
+        return;
+    }
+
+    if (size % 2 == 1) { 
+        if (dim == 0) {
+            int x = xLeft + (xRight - xLeft) / size;
+            buffers.push_back(Buffer(xLeft, x, yLeft, yRight, zLeft, zRight));
+            xLeft = x + 1;
+            dim = 1;
+        }
+        else if (dim == 1) {
+            int y = yLeft + (yRight - yLeft) / size;
+            buffers.push_back(Buffer(xLeft, xRight, yLeft, y, zLeft, zRight));
+            yLeft = y + 1;
+            dim = 2;
+        }
+        else { 
+            int z = zLeft + (zRight - zLeft) / size;
+            buffers.push_back(Buffer(xLeft, xRight, yLeft, yRight, zLeft, z));
+            zLeft = z + 1;
+            dim = 0;
+        }
+
+        size--;
+    }
+
+    
+    if (dim == 0) {
+        int x = (xLeft + xRight) / 2;
+        initializeBuffers(buffers, 1, xLeft, x, yLeft, yRight, zLeft, zRight, size / 2);
+        initializeBuffers(buffers, 1, x + 1, xRight, yLeft, yRight, zLeft, zRight, size / 2);
+    }
+    else if (dim == 1) {
+        int y = (yLeft + yRight) / 2;
+        initializeBuffers(buffers, 2, xLeft, xRight, yLeft, y, zLeft, zRight, size / 2);
+        initializeBuffers(buffers, 2, xLeft, xRight, y + 1, yRight, zLeft, zRight, size / 2);
+    }
+    else {
+        int z = (zLeft + zRight) / 2;
+        initializeBuffers(buffers, 0, xLeft, xRight, yLeft, yRight, zLeft, z, size / 2);
+        initializeBuffers(buffers, 0, xLeft, xRight, yLeft, yRight, z + 1, zRight, size / 2);
+    }
 }
 
-__host__ __device__
-int getIndex(int i, int j, int k, int localY, int localZ) {
-    return i * localY * localZ + j * localZ + k;
+__device__ double analyticalSolution(double x, double y, double z, double t, double at, double Lx, double Ly, double Lz) {
+    return sin(3 * M_PI * x / Lx) * sin(2 * M_PI * y / Ly) * sin(2 * M_PI * z / Lz) * cos(at * t + 4 * M_PI);
 }
 
-__global__
-void initializeField(double* d_u, double* d_x, double* d_y, double* d_z, double Lx, int localX, int localY, int localZ, double t) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (i < localX && j < localY && k < localZ) {
-        int idx = getIndex(i, j, k, localY, localZ);
-        double x = d_x[i];
-        double y = d_y[j];
-        double z = d_z[k];
-        if (x != 0 && x != Lx) {
-            d_u[idx] = analyticalSolution(x, y, z, t, d_Lx, d_Ly, d_Lz, d_at);
+__device__ double phi(double x, double y, double z, double at, double Lx, double Ly, double Lz ) {
+    return analyticalSolution(x, y, z, 0, at, Lx, Ly, Lz);
+}
+
+
+__host__ __device__ inline int getIndex(int i, int j, int k, const Buffer buffer) {
+    return (i - buffer.xLeft) * buffer.yLen * buffer.zLen + (j - buffer.yLeft) * buffer.zLen + (k - buffer.zLeft);
+}
+
+__global__ void initializeField(double *u0, double at, int size, int x1, int y1, int z1, int yLen, int zLen, double hx, double hy, double hz, double Lx, double Ly, double Lz, const Buffer buffer) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size)
+        return;
+
+    int i = x1 + index / (yLen * zLen);
+    int j = y1 + index % (yLen * zLen) / zLen;
+    int k = z1 + index % zLen;
+
+    u0[getIndex(i, j, k, buffer)] = phi(i * hx, j * hy, k * hz, at, Lx, Ly, Lz);
+}
+
+__device__ double getRecvValue(double *u, int i, int j, int k, const Buffer buffer, double *recv, Buffer *recvBuffers, int bufferSize) {
+    if (buffer.xLeft <= i && i <= buffer.xRight && buffer.yLeft <= j && j <= buffer.yRight && buffer.zLeft <= k && k <= buffer.zRight) {
+        return u[getIndex(i, j, k, buffer)];
+    }
+
+    int offset = 0;
+
+    for (int r_i = 0; r_i < bufferSize; r_i++) {
+        Buffer recvBuffer = recvBuffers[r_i];
+
+        if (i < recvBuffer.xLeft || i > recvBuffer.xRight || j < recvBuffer.yLeft || j > recvBuffer.yRight || k < recvBuffer.zLeft || k > recvBuffer.zRight) {
+            offset += recvBuffers[r_i].size;
+            continue;
+        }
+        return recv[offset + getIndex(i, j, k, recvBuffer)];
+    }
+    return 0;
+}
+
+__device__ double computeLaplacianKernel(double *u, int i, int j, int k, const Buffer buffer, double hx, double hy, double hz, double *recv, Buffer *recvBuffers, int bufferSize) {
+    double dx = (getRecvValue(u, i, j - 1, k, buffer, recv, recvBuffers, bufferSize) - 2 * u[getIndex(i, j, k, buffer)] + getRecvValue(u, i, j + 1, k, buffer, recv, recvBuffers, bufferSize)) / (hy * hy);
+    double dy = (getRecvValue(u, i - 1, j, k, buffer,  recv, recvBuffers, bufferSize) - 2 * u[getIndex(i, j, k, buffer)] + getRecvValue(u, i + 1, j, k, buffer, recv, recvBuffers, bufferSize)) / (hx * hx);
+    double dz = (getRecvValue(u,i, j, k - 1, buffer, recv, recvBuffers, bufferSize) - 2 * u[getIndex(i, j, k, buffer)] + getRecvValue(u, i, j, k + 1, buffer, recv, recvBuffers, bufferSize)) / (hz * hz);
+    return dx + dy + dz;
+}
+
+__global__ void updateFieldKernel(double *u, double *u0, double *u1, double *recv, Buffer *recvBuffers, int bufferSize,
+                               int size, int x1, int y1, int z1, int yLen, int zLen, double tau, double hx, double hy, double hz, const Buffer buffer) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size)
+        return;
+
+    int i = x1 + index / (yLen * zLen);
+    int j = y1 + index % (yLen * zLen) / zLen;
+    int k = z1 + index % zLen;
+
+    u[getIndex(i, j, k, buffer)] = 2 * u1[getIndex(i, j, k, buffer)] - u0[getIndex(i, j, k, buffer)] +
+            tau * tau * computeLaplacianKernel(u1, i, j, k, buffer, hx, hy, hz, recv, recvBuffers, bufferSize);
+}
+
+__global__ void initializeU1Kernel(double *u0, double *u1, double *recv, Buffer *recvBuffers, int bufferSize,
+                                     int size, int x1, int y1, int z1, int yLen, int zLen, double tau, double hx, double hy, double hz, const Buffer buffer) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= size)
+        return;
+
+    int i = x1 + index / (yLen * zLen);
+    int j = y1 + index % (yLen * zLen) / zLen;
+    int k = z1 + index % zLen;
+
+    u1[getIndex(i, j, k, buffer)] = u0[getIndex(i, j, k, buffer)] + tau * tau / 2 * computeLaplacianKernel(u0, i, j, k, buffer, hx, hy, hz, recv, recvBuffers, bufferSize);
+}
+
+thrust::host_vector<double> getSendData(thrust::host_vector<double> &u, const Buffer buffer, const Buffer neighbourBuffer) {
+    thrust::host_vector<double> sendData(neighbourBuffer.size);
+
+    for (int i = neighbourBuffer.xLeft; i <= neighbourBuffer.xRight; i++)
+        for (int j = neighbourBuffer.yLeft; j <= neighbourBuffer.yRight; j++)
+            for (int k = neighbourBuffer.zLeft; k <= neighbourBuffer.zRight; k++)
+                sendData[getIndex(i, j, k, neighbourBuffer)] = u[getIndex(i, j, k, buffer)];
+
+    return sendData;
+}
+
+thrust::host_vector<double> communicateBetweenLayers(thrust::host_vector<double> &u, const Buffer buffer,
+                                     thrust::host_vector<Buffer> &sendBuffers, thrust::host_vector<Buffer> &recvBuffers, thrust::host_vector<int> &neighboursRanks) {
+    thrust::host_vector<double> recvData;
+    int offset = 0;
+    thrust::host_vector<MPI_Request> requests(2);
+    thrust::host_vector<MPI_Status> statuses(2);
+
+    for (int i = 0; i < neighboursRanks.size(); i++) {
+        thrust::host_vector<double> sendData = getSendData(u, buffer, sendBuffers[i]);
+        recvData.insert(recvData.end(), recvBuffers[i].size, 0);
+
+        MPI_Isend(sendData.data(), sendBuffers[i].size, MPI_DOUBLE, neighboursRanks[i], 0, MPI_COMM_WORLD, &requests[0]);
+        MPI_Irecv(recvData.data() + offset, recvBuffers[i].size, MPI_DOUBLE, neighboursRanks[i], 0, MPI_COMM_WORLD, &requests[1]);
+        MPI_Waitall(2, requests.data(), statuses.data());
+        offset += recvBuffers[i].size;
+    }
+    return recvData;
+}
+
+__global__ void computeLayerErrorKernel(double *u, double t, double at, const Buffer buffer, double hx, double hy, double hz, double Lx, double Ly, double Lz) {
+    int idx = threadIdx.x;
+
+    for (int index = idx; index < buffer.size; index += numThreads) {
+        int i = buffer.xLeft + index / (buffer.yLen * buffer.zLen);
+        int j = buffer.yLeft + index % (buffer.yLen * buffer.zLen) / buffer.zLen;
+        int k = buffer.zLeft + index % buffer.zLen;
+
+        u[getIndex(i, j, k, buffer)] = fabs(u[getIndex(i, j, k, buffer)] - analyticalSolution(i * hx, j * hy, k * hz, t, at, Lx, Ly, Lz));
+    }
+}
+
+double computeMaximumError(thrust::device_vector<double> &targetU, double t, const Buffer buffer, double hx, double hy, double hz, double Lx, double Ly, double Lz, double at) {
+    computeLayerErrorKernel<<<1, numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), t, at, buffer, hx, hy, hz, Lx, Ly, Lz);
+    thrust::device_vector<double>::iterator iter = thrust::max_element(targetU.begin(), targetU.end());
+
+    double localMaxError = targetU[iter - targetU.begin()];
+    double globalMaxError;
+
+    MPI_Reduce(&localMaxError, &globalMaxError, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    return globalMaxError;
+}
+
+
+__global__ void communicateBoundaryLayer(double *u, const Buffer buffer, double hx, double hy, double hz, double Lx, double Ly, double Lz, double at, double tau, int dim, int border, int iLeft, int jLeft, int iLen, int jLen, bool periodic) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= iLen * jLen)
+        return;
+
+    int i = iLeft + index / jLen;
+    int j = jLeft + index % jLen;
+
+    if (dim == 0) {
+        if (periodic) {
+            u[getIndex(border, i, j, buffer)] = analyticalSolution(border * hx, i * hy, j * hz, tau, at, Lx, Ly, Lz);
         } else {
-            d_u[idx] = 0;
+            u[getIndex(border, i, j, buffer)] = 0;
+        }
+    } else if (dim == 1) {
+        if (periodic) {
+            u[getIndex(i, border, j, buffer)] = analyticalSolution(i * hx, border * hy, j * hz, tau, at, Lx, Ly, Lz);
+        } else {
+            u[getIndex(i, border, j, buffer)] = 0;
+        }
+    } else {
+        if (periodic) {
+            u[getIndex(i, j, border, buffer)] = analyticalSolution(i * hx, j * hy, border * hz, tau, at, Lx, Ly, Lz);
+        } else {
+            u[getIndex(i, j, border, buffer)] = 0;
         }
     }
 }
 
-__global__
-void computeLaplacianKernel(const double* d_u, double* d_laplacian, 
-                            const double* recvLeftX, const double* recvRightX,
-                            const double* recvLeftY, const double* recvRightY,
-                            const double* recvLeftZ, const double* recvRightZ,
-                            int localX, int localY, int localZ,
-                            double hxsq, double hysq, double hzsq) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+void communicateBoundaryLayers(thrust::device_vector<double> &targetU, double tau, const Buffer buffer, int N, double hx, double hy, double hz, double Lx, double Ly, double Lz, double at) {
+    
+    if (buffer.xLeft == 0) {
+        communicateBoundaryLayer<<<((buffer.yLen * buffer.zLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 0, 0, buffer.yLeft, buffer.zLeft, buffer.yLen, buffer.zLen, false);
+    }
 
-    if (i < localX && j < localY && k < localZ) {
-        int idx = getIndex(i, j, k, localY, localZ);
-        double derivativeX, derivativeY, derivativeZ;
+    if (buffer.xRight == N) {
+        communicateBoundaryLayer<<<((buffer.yLen * buffer.zLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 0, N, buffer.yLeft, buffer.zLeft, buffer.yLen, buffer.zLen, false);
+    }
 
-        if (i == 0)
-            derivativeX = (recvLeftX[j * localZ + k] - 2.0 * d_u[idx] + d_u[getIndex(i + 1, j, k, localY, localZ)]) / hxsq;
-        else if (i == localX - 1)
-            derivativeX = (d_u[getIndex(i - 1, j, k, localY, localZ)] - 2.0 * d_u[idx] + recvRightX[j * localZ + k]) / hxsq;
-        else
-            derivativeX = (d_u[getIndex(i - 1, j, k, localY, localZ)] - 2.0 * d_u[idx] + d_u[getIndex(i + 1, j, k, localY, localZ)]) / hxsq;
+    if (buffer.yLeft == 0) {
+        communicateBoundaryLayer<<<((buffer.xLen * buffer.zLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 1, 0, buffer.xLeft, buffer.zLeft, buffer.xLen, buffer.zLen, true);
+    }
 
-        if (j == 0)
-            derivativeY = (recvLeftY[i * localZ + k] - 2.0 * d_u[idx] + d_u[getIndex(i, j + 1, k, localY, localZ)]) / hysq;
-        else if (j == localY - 1)
-            derivativeY = (d_u[getIndex(i, j - 1, k, localY, localZ)] - 2.0 * d_u[idx] + recvRightY[i * localZ + k]) / hysq;
-        else
-            derivativeY = (d_u[getIndex(i, j - 1, k, localY, localZ)] - 2.0 * d_u[idx] + d_u[getIndex(i, j + 1, k, localY, localZ)]) / hysq;
+    if (buffer.yRight == N) {
+        communicateBoundaryLayer<<<((buffer.xLen * buffer.zLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 1, N, buffer.xLeft, buffer.zLeft, buffer.xLen, buffer.zLen, true);
+    }
 
-        if (k == 0)
-            derivativeZ = (recvLeftZ[i * localY + j] - 2.0 * d_u[idx] + d_u[getIndex(i, j, k + 1, localY, localZ)]) / hzsq;
-        else if (k == localZ - 1)
-            derivativeZ = (d_u[getIndex(i, j, k - 1, localY, localZ)] - 2.0 * d_u[idx] + recvRightZ[i * localY + j]) / hzsq;
-        else
-            derivativeZ = (d_u[getIndex(i, j, k - 1, localY, localZ)] - 2.0 * d_u[idx] + d_u[getIndex(i, j, k + 1, localY, localZ)]) / hzsq;
+    if (buffer.zLeft == 0) {
+        communicateBoundaryLayer<<<((buffer.xLen * buffer.yLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 2, 0, buffer.xLeft, buffer.yLeft, buffer.xLen, buffer.yLen, true);
+    }
 
-        d_laplacian[idx] = derivativeX + derivativeY + derivativeZ;
+    if (buffer.zRight == N) {
+        communicateBoundaryLayer<<<((buffer.xLen * buffer.yLen + numThreads - 1) / numThreads), numThreads>>>(thrust::raw_pointer_cast(&targetU[0]), buffer, hx, hy, hz, Lx, Ly, Lz, at, tau, 2, N, buffer.xLeft, buffer.yLeft, buffer.xLen, buffer.yLen, true);
     }
 }
 
-__global__
-void updateFieldKernel(
-    double* d_targetU,
-    const double* d_currentU,
-    const double* d_previousU,
-    const double* d_laplacian, 
-    const double* d_x,
-    double Lx, 
-    double tau_sq, 
-    int localX, 
-    int localY, 
-    int localZ
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+void getNeighbours(const std::vector<Buffer> &buffers, thrust::host_vector<Buffer> &sendBuffers, thrust::host_vector<Buffer> &recvBuffers, thrust::host_vector<int> &neighboursRanks, int rank, int size) {
+    Buffer buffer = buffers[rank];
 
-    if (i < localX && j < localY && k < localZ) {
-        double x = d_x[i];
-        int idx = getIndex(i, j, k, localY, localZ);
+    for (int i = 0; i < size; i++) {
+        if (i == rank)
+            continue;
 
-        if (x != 0.0 && x != Lx) {
-            d_targetU[idx] = 2.0 * d_currentU[idx] - d_previousU[idx] + tau_sq * d_laplacian[idx];
-        } else {
-            d_targetU[idx] = 0;
-        }
-    }
-}
+        Buffer neighbourBuffer = buffers[i];
+        if (buffer.xLeft == neighbourBuffer.xRight + 1 || neighbourBuffer.xLeft == buffer.xRight + 1) {
+            int xSend = buffer.xLeft == neighbourBuffer.xRight + 1 ? buffer.xLeft : buffer.xRight;
+            int xRecv = neighbourBuffer.xLeft == buffer.xRight + 1 ? neighbourBuffer.xLeft : neighbourBuffer.xRight;
+            int yLeft, yRight, zLeft, zRight;
 
-__global__
-void initializeU1Kernel(
-    double* d_targetU,
-    const double* d_currentU,
-    const double* d_laplacian, 
-    const double* d_x,
-    double Lx, 
-    double tau_sq_half, 
-    int localX, 
-    int localY, 
-    int localZ
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+            if (buffer < neighbourBuffer) {
+                yLeft = buffer.yLeft; 
+                yRight = buffer.yRight; 
+                zLeft = buffer.zLeft; 
+                zRight = buffer.zRight;
+            } else if (neighbourBuffer < buffer) {
+                yLeft = neighbourBuffer.yLeft; 
+                yRight = neighbourBuffer.yRight; 
+                zLeft = neighbourBuffer.zLeft; 
+                zRight = neighbourBuffer.zRight;
+            } else {
+                continue;
+            }
+            
+            sendBuffers.push_back(Buffer(xSend, xSend, yLeft, yRight, zLeft, zRight));
+            recvBuffers.push_back(Buffer(xRecv, xRecv, yLeft, yRight, zLeft, zRight));
+            neighboursRanks.push_back(i);
+        } else
+        if (buffer.yLeft == neighbourBuffer.yRight + 1 || neighbourBuffer.yLeft == buffer.yRight + 1) {
+            int ySend = buffer.yLeft == neighbourBuffer.yRight + 1 ? buffer.yLeft : buffer.yRight;
+            int yRecv = neighbourBuffer.yLeft == buffer.yRight + 1 ? neighbourBuffer.yLeft : neighbourBuffer.yRight;
+            int xLeft, xRight, zLeft, zRight;
 
-    if (i < localX && j < localY && k < localZ) {
-        double x = d_x[i];
-        int idx = getIndex(i, j, k, localY, localZ);
+            if (buffer < neighbourBuffer) {
+                xLeft = buffer.xLeft; 
+                xRight = buffer.xRight; 
+                zLeft = buffer.zLeft; 
+                zRight = buffer.zRight;
+            } else if (neighbourBuffer < buffer) {
+                xLeft = neighbourBuffer.xLeft; 
+                xRight = neighbourBuffer.xRight; 
+                zLeft = neighbourBuffer.zLeft; 
+                zRight = neighbourBuffer.zRight;
+            } else {
+                continue;
+            }
+            sendBuffers.push_back(Buffer(xLeft, xRight, ySend, ySend, zLeft, zRight));
+            recvBuffers.push_back(Buffer(xLeft, xRight, yRecv, yRecv, zLeft, zRight));
+            neighboursRanks.push_back(i);
+        } else
+        if (buffer.zLeft == neighbourBuffer.zRight + 1 || neighbourBuffer.zLeft == buffer.zRight + 1) {
+            int zSend = buffer.zLeft == neighbourBuffer.zRight + 1 ? buffer.zLeft : buffer.zRight;
+            int zRecv = neighbourBuffer.zLeft == buffer.zRight + 1 ? neighbourBuffer.zLeft : neighbourBuffer.zRight;
+            int xLeft, xRight, yLeft, yRight;
 
-        if (x != 0.0 && x != Lx) {
-            d_targetU[idx] = d_currentU[idx] + tau_sq_half * d_laplacian[idx];
-        } else {
-            d_targetU[idx] = 0;
+            if (buffer < neighbourBuffer) {
+                xLeft = buffer.xLeft; 
+                xRight = buffer.xRight; 
+                yLeft = buffer.yLeft; 
+                yRight = buffer.yRight;
+            } else if (neighbourBuffer < buffer) {
+                xLeft = neighbourBuffer.xLeft; 
+                xRight = neighbourBuffer.xRight; 
+                yLeft = neighbourBuffer.yLeft; 
+                yRight = neighbourBuffer.yRight;
+            } else {
+                continue;
+            }
+            sendBuffers.push_back(Buffer(xLeft, xRight, yLeft, yRight, zSend, zSend));
+            recvBuffers.push_back(Buffer(xLeft, xRight, yLeft, yRight, zRecv, zRecv));
+            neighboursRanks.push_back(i);
         }
     }
 }
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    
     int rank, size;
-
+    MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    {
+    int N = 128;
+    double T = 0.001;
+    int Nt = 20;
+    double tau = T / Nt;
 
-        int Nx = 128, Ny = 128, Nz = 128;
-        double T = 0.001;
-        int Nt = 20;
-        double tau = T / Nt;
+    double L = 1.0;
+    double hx = 0.0, hy = 0.0, hz = 0.0;
+    double at = 0.0;
 
-        double Lx = 1.0, Ly = 1.0, Lz = 1.0;
-        double hx = 0.0, hy = 0.0, hz = 0.0;
-        double at = 0.0;
-
-        if (argc > 1) {
-            try {
-                double grid_length = std::stod(argv[1]);
-                Nx = Ny = Nz = static_cast<int>(grid_length);
-                if(rank == 0) std::cout << "Grid size set to " << Nx << " in each dimension." << std::endl;
-            } catch (...) {
-                if (rank == 0)
-                    std::cerr << "Provide a number as a first argument" << std::endl;
-                MPI_Finalize();
-                return 1;
-            }
+    if (argc > 1) {
+        try {
+            double grid_length = std::stod(argv[1]);
+            N = static_cast<int>(grid_length);
+        } catch (...) {
+            if (rank == 0)
+                std::cerr << "Provide a number as a first argument" << std::endl;
+            MPI_Finalize();
+            return 1;
         }
-
-        if (argc > 2) {
-            std::string arg = argv[2];
-            if (arg == "pi") {
-                Lx = Ly = Lz = M_PI;
-                if(rank == 0) std::cout << "Domain length set to pi in each dimension." << std::endl;
-            } else {
-                try {
-                    double length = std::stod(arg);
-                    Lx = Ly = Lz = length;
-                    if(rank == 0) std::cout << "Domain length set to " << length << " in each dimension." << std::endl;
-                } catch (...) {
-                    if (rank == 0)
-                        std::cerr << "Provide a number or 'pi' as second argument." << std::endl;
-                    MPI_Finalize();
-                    return 1;
-                }
-            }
-        }
-
-        if (argc > 3) {
-            try {
-                T = std::stod(argv[3]);
-                tau = T / Nt;
-                if(rank == 0) std::cout << "Total time set to " << T << " with " << Nt << " time steps." << std::endl;
-            } catch (...) {
-                if (rank == 0)
-                    std::cerr << "Provide a number as a third argument" << std::endl;
-                MPI_Finalize();
-                return 1;
-            }
-        }
-
-        hx = Lx / (Nx - 1);
-        hy = Ly / (Ny - 1);
-        hz = Lz / (Nz - 1);
-
-        at = M_PI * std::sqrt(9.0 / (Lx * Lx) + 4.0 / (Ly * Ly) + 4.0 / (Lz * Lz));
-
-
-        cudaCheckError(cudaMemcpyToSymbol(d_Lx, &Lx, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_Ly, &Ly, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_Lz, &Lz, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_at, &at, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_hx, &hx, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_hy, &hy, sizeof(double)));
-        cudaCheckError(cudaMemcpyToSymbol(d_hz, &hz, sizeof(double)));
-
-        int dimensionsCount = 3;
-        int gridDimensions[3] = {0, 0, 0};
-        int periodicDirections[3] = {0, 1, 1};
-        int gridCoordinates[3];
-
-        MPI_Dims_create(size, dimensionsCount, gridDimensions);
-        MPI_Comm comm;
-        MPI_Cart_create(MPI_COMM_WORLD, dimensionsCount, gridDimensions, periodicDirections, 0, &comm);
-        MPI_Cart_coords(comm, rank, dimensionsCount, gridCoordinates);
-
- 
-
-        int neighborRanksPrev[3], neighborRanksNext[3];
-        for (int i = 0; i < dimensionsCount; ++i) {
-            MPI_Cart_shift(comm, i, 1, &neighborRanksPrev[i], &neighborRanksNext[i]);
-        }
-
-        int sizes[3] = {Nx, Ny, Nz};
-        int localSizes[3];
-        int startIndex[3], endIndex[3];
-
-        for (int i = 0; i < 3; ++i) {
-            localSizes[i] = sizes[i] / gridDimensions[i];
-            startIndex[i] = localSizes[i] * gridCoordinates[i];
-            endIndex[i] = localSizes[i] * (gridCoordinates[i] + 1);
-            if (gridCoordinates[i] == gridDimensions[i] - 1)
-                endIndex[i] = sizes[i];
-        }
-
-        int localX = endIndex[0] - startIndex[0];
-        int localY = endIndex[1] - startIndex[1];
-        int localZ = endIndex[2] - startIndex[2];
-
-        thrust::host_vector<double> xCoordinates, yCoordinates, zCoordinates;
-        xCoordinates.reserve(localX);
-        yCoordinates.reserve(localY);
-        zCoordinates.reserve(localZ);
-
-        for (int i = startIndex[0]; i < endIndex[0]; ++i)
-            xCoordinates.push_back(i * hx);
-        for (int i = startIndex[1]; i < endIndex[1]; ++i)
-            yCoordinates.push_back(i * hy);
-        for (int i = startIndex[2]; i < endIndex[2]; ++i)
-            zCoordinates.push_back(i * hz);
-
-
-        thrust::device_vector<double> d_x(localX);
-        thrust::device_vector<double> d_y(localY);
-        thrust::device_vector<double> d_z(localZ);
-
-        thrust::copy(xCoordinates.begin(), xCoordinates.end(), d_x.begin());
-        thrust::copy(yCoordinates.begin(), yCoordinates.end(), d_y.begin());
-        thrust::copy(zCoordinates.begin(), zCoordinates.end(), d_z.begin());
-
-        int totalLocalPoints = localX * localY * localZ;
-        thrust::host_vector<double> h_u0(totalLocalPoints, 0.0);
-        thrust::host_vector<double> h_u1(totalLocalPoints, 0.0);
-        thrust::host_vector<double> h_u2(totalLocalPoints, 0.0);
-
-        int layerSizeYZ = localY * localZ;
-        int layerSizeXZ = localX * localZ;
-        int layerSizeXY = localY * localX;
-
-        thrust::host_vector<double> sendLeftX, recvLeftX,
-                                 sendRightX, recvRightX,
-                                 sendLeftY, recvLeftY,
-                                 sendRightY, recvRightY,
-                                 sendLeftZ, recvLeftZ,
-                                 sendRightZ, recvRightZ;
-
-        thrust::device_vector<double> recvLeftX_dev, recvRightX_dev,
-                                  recvLeftY_dev, recvRightY_dev,
-                                  recvLeftZ_dev, recvRightZ_dev;
-
-        sendLeftX.resize(layerSizeYZ, 0.0); recvLeftX.resize(layerSizeYZ, 0.0);
-        sendRightX.resize(layerSizeYZ, 0.0); recvRightX.resize(layerSizeYZ, 0.0);
-
-        sendLeftY.resize(layerSizeXZ, 0.0); recvLeftY.resize(layerSizeXZ, 0.0);
-        sendRightY.resize(layerSizeXZ, 0.0); recvRightY.resize(layerSizeXZ, 0.0);
-
-        sendLeftZ.resize(layerSizeXY, 0.0); recvLeftZ.resize(layerSizeXY, 0.0);
-        sendRightZ.resize(layerSizeXY, 0.0); recvRightZ.resize(layerSizeXY, 0.0);
-
-        thrust::device_vector<double> d_u0(totalLocalPoints, 0.0);
-        thrust::device_vector<double> d_u1(totalLocalPoints, 0.0);
-        thrust::device_vector<double> d_u2(totalLocalPoints, 0.0);
-        thrust::device_vector<double> d_laplacian(totalLocalPoints, 0.0);
-
-        dim3 blockDim(numThreads, 1, 1);
-        dim3 gridDim((localX + blockDim.x - 1) / blockDim.x,
-                    (localY + blockDim.y - 1) / blockDim.y,
-                    (localZ + blockDim.z - 1) / blockDim.z);
-
-
-        initializeField<<<gridDim, blockDim>>>(
-            thrust::raw_pointer_cast(d_u0.data()),
-            thrust::raw_pointer_cast(d_x.data()),
-            thrust::raw_pointer_cast(d_y.data()),
-            thrust::raw_pointer_cast(d_z.data()),
-            Lx,
-            localX, localY, localZ, 0.0
-        );
-        cudaCheckError(cudaGetLastError());
-        cudaCheckError(cudaDeviceSynchronize());
-
-        double startTime = MPI_Wtime();
-
-        auto communicateBoundaryLayers = [&](const thrust::host_vector<double>& h_u) {
-            for(int j = 0; j < localY; j++)
-                for(int k = 0; k < localZ; k++) {
-                    sendLeftX[j * localZ + k] = h_u[getIndex(0, j, k, localY, localZ)];
-                    sendRightX[j * localZ + k] = h_u[getIndex(localX - 1, j, k, localY, localZ)];
-                }
-
-            for(int i = 0; i < localX; i++)
-                for(int k = 0; k < localZ; k++) {
-                    sendLeftY[i * localZ + k] = h_u[getIndex(i, 0, k, localY, localZ)];
-                    sendRightY[i * localZ + k] = h_u[getIndex(i, localY - 1, k, localY, localZ)];
-                }
-
-            for(int i = 0; i < localX; i++)
-                for(int j = 0; j < localY; j++) {
-                    sendLeftZ[i * localY + j] = h_u[getIndex(i, j, 0, localY, localZ)];
-                    sendRightZ[i * localY + j] = h_u[getIndex(i, j, localZ - 1, localY, localZ)];
-                }
-
-            MPI_Request requests[12];
-            int requestCount = 0;
-
-            if (neighborRanksPrev[0] != MPI_PROC_NULL) {
-                MPI_Irecv(recvLeftX.data(), layerSizeYZ, MPI_DOUBLE, neighborRanksPrev[0], 0, comm, &requests[requestCount++]);
-                MPI_Isend(sendLeftX.data(), layerSizeYZ, MPI_DOUBLE, neighborRanksPrev[0], 1, comm, &requests[requestCount++]);
-            }
-            if (neighborRanksNext[0] != MPI_PROC_NULL) {
-                MPI_Irecv(recvRightX.data(), layerSizeYZ, MPI_DOUBLE, neighborRanksNext[0], 1, comm, &requests[requestCount++]);
-                MPI_Isend(sendRightX.data(), layerSizeYZ, MPI_DOUBLE, neighborRanksNext[0], 0, comm, &requests[requestCount++]);
-            }
-
-            if (neighborRanksPrev[1] != MPI_PROC_NULL) {
-                MPI_Irecv(recvLeftY.data(), layerSizeXZ, MPI_DOUBLE, neighborRanksPrev[1], 2, comm, &requests[requestCount++]);
-                MPI_Isend(sendLeftY.data(), layerSizeXZ, MPI_DOUBLE, neighborRanksPrev[1], 3, comm, &requests[requestCount++]);
-            }
-            if (neighborRanksNext[1] != MPI_PROC_NULL) {
-                MPI_Irecv(recvRightY.data(), layerSizeXZ, MPI_DOUBLE, neighborRanksNext[1], 3, comm, &requests[requestCount++]);
-                MPI_Isend(sendRightY.data(), layerSizeXZ, MPI_DOUBLE, neighborRanksNext[1], 2, comm, &requests[requestCount++]);
-            }
-
-            if (neighborRanksPrev[2] != MPI_PROC_NULL) {
-                MPI_Irecv(recvLeftZ.data(), layerSizeXY, MPI_DOUBLE, neighborRanksPrev[2], 4, comm, &requests[requestCount++]);
-                MPI_Isend(sendLeftZ.data(), layerSizeXY, MPI_DOUBLE, neighborRanksPrev[2], 5, comm, &requests[requestCount++]);
-            }
-            if (neighborRanksNext[2] != MPI_PROC_NULL) {
-                MPI_Irecv(recvRightZ.data(), layerSizeXY, MPI_DOUBLE, neighborRanksNext[2], 5, comm, &requests[requestCount++]);
-                MPI_Isend(sendRightZ.data(), layerSizeXY, MPI_DOUBLE, neighborRanksNext[2], 4, comm, &requests[requestCount++]);
-            }
-
-            if(requestCount > 0) {
-                MPI_Waitall(requestCount, requests, MPI_STATUSES_IGNORE);
-            }
-
-            if (neighborRanksPrev[0] != MPI_PROC_NULL || neighborRanksNext[0] != MPI_PROC_NULL) {
-                if (recvLeftX_dev.size() != layerSizeYZ)
-                    recvLeftX_dev.resize(layerSizeYZ);
-                if (recvRightX_dev.size() != layerSizeYZ)
-                    recvRightX_dev.resize(layerSizeYZ);
-
-                thrust::copy(recvLeftX.begin(), recvLeftX.end(), recvLeftX_dev.begin());
-                thrust::copy(recvRightX.begin(), recvRightX.end(), recvRightX_dev.begin());
-            }
-            else {
-                if (recvLeftX_dev.size() != layerSizeYZ)
-                    recvLeftX_dev.resize(layerSizeYZ, 0.0);
-                else
-                    thrust::fill(recvLeftX_dev.begin(), recvLeftX_dev.end(), 0.0);
-
-                if (recvRightX_dev.size() != layerSizeYZ)
-                    recvRightX_dev.resize(layerSizeYZ, 0.0);
-                else
-                    thrust::fill(recvRightX_dev.begin(), recvRightX_dev.end(), 0.0);
-            }
-
-            if (recvLeftY_dev.size() != layerSizeXZ)
-                recvLeftY_dev.resize(layerSizeXZ);
-            thrust::copy(recvLeftY.begin(), recvLeftY.end(), recvLeftY_dev.begin());
-
-            if (recvRightY_dev.size() != layerSizeXZ)
-                recvRightY_dev.resize(layerSizeXZ);
-            thrust::copy(recvRightY.begin(), recvRightY.end(), recvRightY_dev.begin());
-
-            if (recvLeftZ_dev.size() != layerSizeXY)
-                recvLeftZ_dev.resize(layerSizeXY);
-            thrust::copy(recvLeftZ.begin(), recvLeftZ.end(), recvLeftZ_dev.begin());
-
-            if (recvRightZ_dev.size() != layerSizeXY)
-                recvRightZ_dev.resize(layerSizeXY);
-            thrust::copy(recvRightZ.begin(), recvRightZ.end(), recvRightZ_dev.begin());
-
-            cudaCheckError(cudaDeviceSynchronize());
-        };
-
-        thrust::host_vector<double> h_u0_host = h_u0;
-        thrust::copy(d_u0.begin(), d_u0.end(), h_u0_host.begin());
-        communicateBoundaryLayers(h_u0_host);
-
-        thrust::copy(d_u0.begin(), d_u0.end(), d_u1.begin());
-
-        computeLaplacianKernel<<<gridDim, blockDim>>>(
-            thrust::raw_pointer_cast(d_u0.data()),
-            thrust::raw_pointer_cast(d_laplacian.data()),
-            thrust::raw_pointer_cast(recvLeftX_dev.data()),
-            thrust::raw_pointer_cast(recvRightX_dev.data()),
-            thrust::raw_pointer_cast(recvLeftY_dev.data()),
-            thrust::raw_pointer_cast(recvRightY_dev.data()),
-            thrust::raw_pointer_cast(recvLeftZ_dev.data()),
-            thrust::raw_pointer_cast(recvRightZ_dev.data()),
-            localX, localY, localZ,
-            hx * hx, hy * hy, hz * hz
-        );
-        cudaCheckError(cudaGetLastError());
-        cudaCheckError(cudaDeviceSynchronize());
-
-        double tau_sq_half = 0.5 * tau * tau;
-
-        initializeU1Kernel<<<gridDim, blockDim>>>(
-            thrust::raw_pointer_cast(d_u1.data()),
-            thrust::raw_pointer_cast(d_u0.data()),
-            thrust::raw_pointer_cast(d_laplacian.data()),
-            thrust::raw_pointer_cast(d_x.data()),
-            Lx,
-            tau_sq_half, localX, localY, localZ
-        );
-        cudaCheckError(cudaGetLastError());
-        cudaCheckError(cudaDeviceSynchronize());
-
-        thrust::copy(d_u1.begin(), d_u1.end(), h_u1.begin());
-
-        thrust::host_vector<double> h_analytical(totalLocalPoints, 0.0);
-        for(int i = 0; i < localX; i++)
-            for(int j = 0; j < localY; j++)
-                for(int k = 0; k < localZ; k++) {
-                    int idx = getIndex(i, j, k, localY, localZ);
-                    h_analytical[idx] = analyticalSolution(xCoordinates[i], yCoordinates[j], zCoordinates[k], tau, Lx, Ly, Lz, at);
-                }
-
-        double localMaxError = 0.0;
-        for(int idx = 0; idx < totalLocalPoints; idx++) {
-            double error = fabs(h_u1[idx] - h_analytical[idx]);
-            if(error > localMaxError)
-                localMaxError = error;
-        }
-
-        double globalMaxError;
-        MPI_Reduce(&localMaxError, &globalMaxError, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-        if(rank == 0)
-            std::cout << "\nTime step: 0 Max err: " << globalMaxError << std::endl;
-
-        for(int timestep = 1; timestep < Nt; timestep++) {
-            thrust::copy(d_u1.begin(), d_u1.end(), h_u1.begin());
-            communicateBoundaryLayers(h_u1);
-
-            computeLaplacianKernel<<<gridDim, blockDim>>>(
-                thrust::raw_pointer_cast(d_u1.data()),
-                thrust::raw_pointer_cast(d_laplacian.data()),
-                thrust::raw_pointer_cast(recvLeftX_dev.data()),
-                thrust::raw_pointer_cast(recvRightX_dev.data()),
-                thrust::raw_pointer_cast(recvLeftY_dev.data()),
-                thrust::raw_pointer_cast(recvRightY_dev.data()),
-                thrust::raw_pointer_cast(recvLeftZ_dev.data()),
-                thrust::raw_pointer_cast(recvRightZ_dev.data()),
-                localX, localY, localZ,
-                hx * hx, hy * hy, hz * hz
-            );
-            cudaCheckError(cudaGetLastError());
-            cudaCheckError(cudaDeviceSynchronize());
-
-            updateFieldKernel<<<gridDim, blockDim>>>(
-                thrust::raw_pointer_cast(d_u2.data()),
-                thrust::raw_pointer_cast(d_u1.data()),
-                thrust::raw_pointer_cast(d_u0.data()),
-                thrust::raw_pointer_cast(d_laplacian.data()),
-                thrust::raw_pointer_cast(d_x.data()),
-                Lx,
-                tau * tau,
-                localX, localY, localZ
-            );
-            cudaCheckError(cudaGetLastError());
-            cudaCheckError(cudaDeviceSynchronize());
-
-            thrust::copy(d_u2.begin(), d_u2.end(), h_u2.begin());
-            thrust::host_vector<double> h_analytical_step(totalLocalPoints, 0.0);
-            for(int i = 0; i < localX; i++)
-                for(int j = 0; j < localY; j++)
-                    for(int k = 0; k < localZ; k++) {
-                        int idx = getIndex(i, j, k, localY, localZ);
-                        h_analytical_step[idx] = analyticalSolution(xCoordinates[i], yCoordinates[j], zCoordinates[k], tau * (timestep + 1), Lx, Ly, Lz, at);
-                    }
-
-            double localMaxErrorStep = 0.0;
-            for(int idx = 0; idx < totalLocalPoints; idx++) {
-                double error = fabs(h_u2[idx] - h_analytical_step[idx]);
-                if(error > localMaxErrorStep)
-                    localMaxErrorStep = error;
-            }
-
-            double globalMaxErrorStep;
-            MPI_Reduce(&localMaxErrorStep, &globalMaxErrorStep, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-            if(rank == 0)
-                std::cout << "Time step: " << timestep << " Max err: " << globalMaxErrorStep << std::endl;
-
-            d_u0.swap(d_u1);
-            d_u1.swap(d_u2);
-        }
-
-        double endTime = MPI_Wtime();
-        double elapsedTime = endTime - startTime;
-        double maxElapsedTime;
-
-        MPI_Reduce(&elapsedTime, &maxElapsedTime, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-        if(rank == 0)
-            std::cout << "\nTotal simulation time: " << maxElapsedTime << " seconds" << std::endl;
     }
 
-    cudaCheckError(cudaDeviceReset());
+    if (argc > 2) {
+        std::string arg = argv[2];
+        if (arg == "pi") {
+            L = M_PI;
+            if(rank == 0) std::cout << "Domain length set to pi in each dimension." << std::endl;
+        } else {
+            try {
+                double length = std::stod(arg);
+                L = length;
+                if(rank == 0) std::cout << "Domain length set to " << length << " in each dimension." << std::endl;
+            } catch (...) {
+                if (rank == 0)
+                    std::cerr << "Provide a number or 'pi' as second argument." << std::endl;
+                MPI_Finalize();
+                return 1;
+            }
+        }
+    }
 
+    if (argc > 3) {
+        try {
+            T = std::stod(argv[3]);
+            tau = T / Nt;
+            if(rank == 0) std::cout << "Total time set to " << T << " with " << Nt << " time steps." << std::endl;
+        } catch (...) {
+            if (rank == 0)
+                std::cerr << "Provide a number as a third argument" << std::endl;
+            MPI_Finalize();
+            return 1;
+        }
+    }
+
+    double startTime = MPI_Wtime();
+
+    double Lx = L;
+    double Ly = L;
+    double Lz = L;
+
+    hx = Lx / N;
+    hy = Ly / N;
+    hz = Lz / N;
+
+    tau = T / Nt;
+
+    at = M_PI * sqrt(9.0 / (Lx * Lx) + 4.0 / (Ly * Ly) + 4.0 / (Lz * Lz));
+
+    std::vector<Buffer> buffers;
+    initializeBuffers(buffers, 0, 0, N, 0, N, 0, N, size);
+    Buffer buffer = buffers[rank];
+
+    std::vector< thrust::device_vector<double> > u(3);
+    for (int i = 0; i < 3; i++)
+        u[i].resize(buffer.size);
+
+    thrust::host_vector<Buffer> sendBuffers, recvBuffers;
+    thrust::host_vector<int> neighboursRanks;
+    getNeighbours(buffers, sendBuffers, recvBuffers, neighboursRanks, rank, size);
+
+    communicateBoundaryLayers(u[0], 0, buffer, N, hx, hy, hz, Lx, Ly, Lz, at);
+    communicateBoundaryLayers(u[1], tau, buffer, N, hx, hy, hz, Lx, Ly, Lz, at);
+
+    int x1 = std::max(buffer.xLeft, 1); int x2 = std::min(buffer.xRight, N - 1);
+    int y1 = std::max(buffer.yLeft, 1); int y2 = std::min(buffer.yRight, N - 1);
+    int z1 = std::max(buffer.zLeft, 1); int z2 = std::min(buffer.zRight, N - 1);
+    
+    int localX = x2 - x1 + 1;
+    int localY = y2 - y1 + 1;
+    int localZ = z2 - z1 + 1;
+    int layerSize = localX * localY * localZ;
+
+    initializeField<<<(layerSize + numThreads - 1) / numThreads, numThreads>>>(thrust::raw_pointer_cast(&u[0][0]), at, layerSize, x1, y1, z1, localY, localZ, hx, hy, hz, Lx, Ly, Lz, buffer);
+
+    thrust::host_vector<double> u0(u[0]);
+    thrust::host_vector<double> recv = communicateBetweenLayers(u0, buffer, sendBuffers, recvBuffers, neighboursRanks);
+    thrust::device_vector<double> recvData(recv);
+    thrust::device_vector<Buffer> recvBuffer(recvBuffers);
+
+    initializeU1Kernel<<<(layerSize + numThreads - 1) / numThreads, numThreads>>>(thrust::raw_pointer_cast(&u[0][0]), thrust::raw_pointer_cast(&u[1][0]), thrust::raw_pointer_cast(&recvData[0]), thrust::raw_pointer_cast(&recvBuffer[0]), recvBuffers.size(), layerSize, x1, y1, z1, localY, localZ, tau, hx, hy, hz, buffer);
+    
+    for (int timestep = 2; timestep <= Nt; timestep++) {
+        thrust::host_vector<double> currentU(u[(timestep + 2) % 3]);
+        recv = communicateBetweenLayers(currentU, buffer, sendBuffers, recvBuffers, neighboursRanks);
+        thrust::device_vector<double> recvData(recv);
+        thrust::device_vector<Buffer> recvBuffer(recvBuffers);
+
+        updateFieldKernel<<<(layerSize + numThreads - 1) / numThreads, numThreads>>>(thrust::raw_pointer_cast(&u[timestep % 3][0]), thrust::raw_pointer_cast(&u[(timestep + 1) % 3][0]), thrust::raw_pointer_cast(&u[(timestep + 2) % 3][0]), thrust::raw_pointer_cast(&recvData[0]), thrust::raw_pointer_cast(&recvBuffer[0]), recvBuffers.size(), layerSize, x1, y1, z1, localY, localZ, tau, hx, hy, hz, buffer);
+        communicateBoundaryLayers(u[timestep % 3], timestep * tau, buffer, N, hx, hy, hz, Lx, Ly, Lz, at);
+    }
+
+    double finalError = computeMaximumError(u[Nt % 3], Nt * tau, buffer, hx, hy, hz, Lx, Ly, Lz, at);
+    
+    double endTime = MPI_Wtime();
+    double elapsedTime = endTime - startTime;
+    double maxElapsedTime;
+    MPI_Reduce(&elapsedTime, &maxElapsedTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "\n\nTotal time: " << maxElapsedTime << " seconds, Max err: " << finalError  << std::endl; 
+    }
     MPI_Finalize();
-
     return 0;
 }
